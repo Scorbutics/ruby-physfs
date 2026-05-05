@@ -1,0 +1,11 @@
+tmp/
+lib/physfs/*.so
+lib/physfs/*.bundle
+pkg/
+*.o
+*.so
+*.bundle
+*.dylib
+Makefile
+mkmf.log
+.bundle/
