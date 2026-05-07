@@ -14,12 +14,24 @@
 #include <string_view>
 #include <vector>
 
+// Forward-declared so this header doesn't have to drag in <physfs.h> for
+// callers that only touch the path-based API.
+struct PHYSFS_Io;
+
 // Internal C++ namespace for this gem. Distinct from the C library's
 // PHYSFS_ prefix so they coexist cleanly inside the same translation unit.
 namespace physfs_gem {
 	// Mount a zip / directory at the given mount point. prepend=true raises
 	// priority above earlier mounts at the same point.
 	void mount(const std::string& source, const std::string& mountPoint = "/", bool prepend = false);
+
+	// Mount via a caller-provided PHYSFS_Io (e.g. a streaming decrypter).
+	// PhysFS takes ownership: it will call io->destroy when the mount is
+	// released. If PHYSFS_mountIo fails, this function calls io->destroy
+	// itself before throwing — callers must not double-free.
+	void mountIo(PHYSFS_Io* io, const std::string& fakeName,
+	             const std::string& mountPoint = "/", bool prepend = false);
+
 	void unmount(const std::string& source);
 
 	// Set the writable native dir. Mounts it at priority 0 so written files

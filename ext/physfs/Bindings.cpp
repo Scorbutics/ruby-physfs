@@ -1,5 +1,6 @@
 #include "Bindings.h"
 #include "PhysFSGem.h"
+#include "RubyIoBridge.h"
 #include "Shim.h"
 #include "physfs_wrapper.h"
 #include "RubyValueHelper.h"
@@ -32,6 +33,32 @@ namespace {
 		}
 		// Auto-activate the shim on the first mount. Idempotent for further
 		// mounts. Embedders that called install_shim! explicitly are unaffected.
+		if (g_mount_count++ == 0) PhysFSShim_Activate();
+		PhysFSShim_InvalidatePathCache();
+		return Qnil;
+	}
+
+	VALUE rb_PhysFS_MountIo(int argc, VALUE* argv, VALUE) {
+		VALUE io_obj, fakeName, mountPoint, prepend;
+		rb_scan_args(argc, argv, "22", &io_obj, &fakeName, &mountPoint, &prepend);
+		Check_Type(fakeName, T_STRING);
+		const auto fn   = toStdString(fakeName);
+		const auto mp   = NIL_P(mountPoint) ? std::string{ "/" } : toStdString(mountPoint);
+		const bool prep = !NIL_P(prepend) && RTEST(prepend);
+
+		PHYSFS_Io* io = physfs_gem::CreatePhysFSIoFromRubyObject(io_obj);
+		if (!io) {
+			rb_raise(rb_ePhysFSError, "Failed to allocate PhysFS_Io bridge");
+		}
+		try {
+			physfs_gem::mountIo(io, fn, mp, prep);
+		} catch (const std::exception& e) {
+			// mountIo already destroyed `io` on failure, so don't double-free.
+			rb_raise(rb_ePhysFSError, "%s", e.what());
+		}
+		// First mount activates the File/Dir/IO/require shim, same as
+		// PhysFS.mount above. Keeps the two surfaces interchangeable from
+		// the shim-lifecycle point of view.
 		if (g_mount_count++ == 0) PhysFSShim_Activate();
 		PhysFSShim_InvalidatePathCache();
 		return Qnil;
@@ -112,6 +139,7 @@ namespace {
 
 void PhysFSGem_DefineModuleMethods() {
 	rb_define_module_function(rb_mPhysFS, "mount",           _rbf rb_PhysFS_Mount,         -1);
+	rb_define_module_function(rb_mPhysFS, "mount_io",        _rbf rb_PhysFS_MountIo,       -1);
 	rb_define_module_function(rb_mPhysFS, "unmount",         _rbf rb_PhysFS_Unmount,        1);
 	rb_define_module_function(rb_mPhysFS, "write_dir=",      _rbf rb_PhysFS_SetWriteDir,    1);
 	rb_define_module_function(rb_mPhysFS, "write_dir",       _rbf rb_PhysFS_GetWriteDir,    0);

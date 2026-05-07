@@ -37,6 +37,19 @@ namespace physfs_gem {
 		}
 	}
 
+	void mountIo(PHYSFS_Io* io, const std::string& fakeName,
+	             const std::string& mountPoint, bool prepend) {
+		ensureInit();
+		const int appendFlag = prepend ? 0 : 1;
+		if (PHYSFS_mountIo(io, fakeName.c_str(), mountPoint.c_str(), appendFlag) == 0) {
+			// PHYSFS_mountIo's contract: on failure, the caller still owns the
+			// PHYSFS_Io. Destroy it ourselves so the caller can't double-free.
+			if (io && io->destroy) io->destroy(io);
+			throwPhysFSError("PhysFS mountIo failed for '" + fakeName +
+			                 "' at '" + mountPoint + "'");
+		}
+	}
+
 	void unmount(const std::string& source) {
 		if (!PHYSFS_isInit()) return;
 		if (PHYSFS_unmount(source.c_str()) == 0) {
