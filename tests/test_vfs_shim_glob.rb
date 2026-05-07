@@ -35,10 +35,24 @@ class TestVFSShimGlob < Minitest::Test
     star_literal_*.txt
   ].freeze
 
+  # Detect case-insensitive scratch FS (default on macOS APFS / HFS+). When
+  # the host is case-insensitive, native Dir.glob is implicitly case-folding,
+  # which makes it useless as an oracle for case-sensitivity assertions and
+  # corrupts the unrelated comparisons that happen to include UPPER.TXT.
+  def case_insensitive_fs?(dir)
+    probe = File.join(dir, ".__case_probe__")
+    File.binwrite(probe, "x")
+    insensitive = File.exist?(File.join(dir, ".__CASE_PROBE__"))
+    File.delete(probe)
+    insensitive
+  end
+
   def setup
     @archive = Dir.mktmpdir("vfs_glob_arch_")
     @real    = Dir.mktmpdir("vfs_glob_real_")
-    FIXTURE_FILES.each do |rel|
+    @case_insensitive = case_insensitive_fs?(@real)
+    fixtures = @case_insensitive ? FIXTURE_FILES - %w[UPPER.TXT] : FIXTURE_FILES
+    fixtures.each do |rel|
       [@archive, @real].each do |root|
         full = File.join(root, rel)
         FileUtils.mkdir_p(File.dirname(full))
@@ -129,11 +143,13 @@ class TestVFSShimGlob < Minitest::Test
   # ---------- case folding ----------
 
   def test_case_sensitive_by_default
+    skip "Host FS is case-insensitive; native Dir.glob is not a valid oracle" if @case_insensitive
     # `*.txt` should NOT match UPPER.TXT
     assert_archive_matches_native("*.txt")
   end
 
   def test_case_insensitive_with_FNM_CASEFOLD
+    skip "Host FS is case-insensitive; UPPER.TXT cannot be fixtured distinctly" if @case_insensitive
     assert_archive_matches_native("*.txt", File::FNM_CASEFOLD)
   end
 
