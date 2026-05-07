@@ -33,6 +33,7 @@ namespace physfs_gem {
 	bool exists(std::string_view path);
 	bool isDirectory(std::string_view path);
 	std::int64_t mtime(std::string_view path);  // 0 if missing
+	std::int64_t fileSize(std::string_view path);  // -1 if missing / not a regular file
 	std::vector<std::string> enumerate(std::string_view directory);
 
 	// Read entire file into a buffer. Used by File.read / require shim paths

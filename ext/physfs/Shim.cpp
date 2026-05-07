@@ -312,6 +312,20 @@ namespace {
 		return shim_super_kw(argc, argv);
 	}
 
+	// File.size(path) — byte count via PHYSFS_stat (no file body read).
+	// Directories and missing entries fall through to super so the real-FS
+	// behavior (Errno::ENOENT for missing, EISDIR for directories) is
+	// preserved when the path isn't a regular VFS file.
+	VALUE rb_File_size(int argc, VALUE* argv, VALUE /*self*/) {
+		SHIM_PASSTHROUGH_IF_INACTIVE();
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		const auto p = resolveVirtualPath(argv[0]);
+		const auto sz = physfs_gem::fileSize(p);
+		if (sz < 0) return shim_super_kw(argc, argv);
+		return LL2NUM(static_cast<long long>(sz));
+	}
+
 	// File.read / binread / readlines: only the simple "read whole file" form
 	// is VFS-backed. length/offset variants fall through to super.
 	VALUE rb_File_read(int argc, VALUE* argv, VALUE /*self*/) {
@@ -380,6 +394,36 @@ namespace {
 		OpenCtx ctx{ io };
 		return rb_ensure(openYieldBody, reinterpret_cast<VALUE>(&ctx),
 		                 openCloseEnsure, reinterpret_cast<VALUE>(&ctx));
+	}
+
+	// File.new(path, mode) — same VFS-vs-super decision as File.open, but
+	// File.new never takes a block. Returning a StringIO duck-types as the
+	// IO interface that downstream code (Marshal.load(io), io.read, io.pos=)
+	// actually exercises. Write/update modes ('w', 'a', 'rb+', '+', numeric
+	// flags, kwargs, etc.) all super-forward to the real File constructor.
+	//
+	// Motivated by Pokémon SDK's Yuki::VD reader, which does
+	//   @file = File.new(filename, 'rb')
+	//   Marshal.load(@file)
+	// against archive-bundled .dat files.
+	VALUE rb_File_new(int argc, VALUE* argv, VALUE /*self*/) {
+		SHIM_PASSTHROUGH_IF_INACTIVE();
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc < 1 || argc > 2) return shim_super_kw(argc, argv);
+		if (!RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+
+		const VALUE mode_v = (argc >= 2) ? argv[1] : Qnil;
+		if (!NIL_P(mode_v) && !RB_TYPE_P(mode_v, T_STRING)) {
+			return shim_super_kw(argc, argv);
+		}
+		if (parseMode(mode_v) == OpenIntent::Write) return shim_super_kw(argc, argv);
+
+		const auto p = resolveVirtualPath(argv[0]);
+		if (!physfs_gem::exists(p)) return shim_super_kw(argc, argv);
+
+		VALUE bytes = readVfsAsRubyString(p);
+		VALUE rb_StringIO = rb_const_get(rb_cObject, rb_intern("StringIO"));
+		return rb_funcall(rb_StringIO, rb_intern("new"), 1, bytes);
 	}
 
 	// File.copy_stream(src, dst): if src is in VFS, read it and write dst
@@ -585,10 +629,12 @@ namespace {
 		rb_define_method(m_FileShim, "directory?",  _rbf rb_File_directory_q,  -1);
 		rb_define_method(m_FileShim, "file?",       _rbf rb_File_file_q,       -1);
 		rb_define_method(m_FileShim, "mtime",       _rbf rb_File_mtime,        -1);
+		rb_define_method(m_FileShim, "size",        _rbf rb_File_size,         -1);
 		rb_define_method(m_FileShim, "read",        _rbf rb_File_read,         -1);
 		rb_define_method(m_FileShim, "binread",     _rbf rb_File_binread,      -1);
 		rb_define_method(m_FileShim, "readlines",   _rbf rb_File_readlines,    -1);
 		rb_define_method(m_FileShim, "open",        _rbf rb_File_open,         -1);
+		rb_define_method(m_FileShim, "new",         _rbf rb_File_new,          -1);
 		rb_define_method(m_FileShim, "copy_stream", _rbf rb_File_copy_stream,  -1);
 		rb_prepend_module(rb_singleton_class(rb_cFile), m_FileShim);
 

@@ -86,6 +86,14 @@ namespace physfs_gem {
 		return raw.modtime;
 	}
 
+	std::int64_t fileSize(std::string_view path) {
+		if (!PHYSFS_isInit()) return -1;
+		PHYSFS_Stat raw{};
+		if (PHYSFS_stat(toString(path).c_str(), &raw) == 0) return -1;
+		if (raw.filetype != PHYSFS_FILETYPE_REGULAR) return -1;
+		return raw.filesize;
+	}
+
 	std::vector<std::string> enumerate(std::string_view directory) {
 		if (!PHYSFS_isInit()) return {};
 		std::vector<std::string> result;

@@ -168,6 +168,70 @@ class TestVFSShim < Minitest::Test
     assert_equal "first\nsecond\n", File.binread(target)
   end
 
+  # ---------- File.new ----------
+
+  def test_file_new_read_returns_stringio_for_archived_file
+    fixture(@archive, "via_new.txt", "abc")
+    mount_archive
+    io = File.new("via_new.txt", "rb")
+    assert_equal "abc", io.read
+    io.close
+  end
+
+  def test_file_new_supports_yuki_vd_style_random_access_and_marshal
+    # Regression: Pokémon SDK's Yuki::VD reader does
+    #   @file = File.new(filename, 'rb')
+    #   @file.pos = @file.read(4).unpack1('V')   # rewind + reposition
+    #   @hash = Marshal.load(@file)
+    # The shim must return an IO-like object that supports pos= / read /
+    # being passed to Marshal.load directly.
+    payload = Marshal.dump({ "k" => "v", "n" => 42 })
+    bytes = [payload.bytesize].pack("V") + payload
+    fixture(@archive, "vfs_vd.dat", bytes)
+    mount_archive
+    io = File.new("vfs_vd.dat", "rb")
+    header = io.read(4)
+    payload_size = header.unpack1("V")
+    assert_equal payload.bytesize, payload_size
+    io.pos = 4
+    decoded = Marshal.load(io)
+    assert_equal({ "k" => "v", "n" => 42 }, decoded)
+    io.close
+  end
+
+  def test_file_new_write_mode_falls_through_to_real_fs
+    target = File.join(@real, "via_new_w.txt")
+    mount_archive
+    f = File.new(target, "wb")
+    f.write("native-write")
+    f.close
+    assert_equal "native-write", File.binread(target)
+  end
+
+  # ---------- File.size ----------
+
+  def test_file_size_returns_byte_count_for_archived_file
+    fixture(@archive, "blob.bin", "1234567890")
+    mount_archive
+    assert_equal 10, File.size("blob.bin")
+  end
+
+  def test_file_size_falls_through_for_real_fs_files
+    real = fixture(@real, "real_size.txt", "hello")
+    mount_archive
+    assert_equal 5, File.size(real)
+  end
+
+  def test_file_size_super_forwards_for_archive_directories
+    # Directories aren't regular files, so PhysFS's filetype check rejects
+    # them and we super-forward. With no real-FS counterpart, the native
+    # File.size raises Errno::ENOENT — that's the right thing: matches what
+    # plain Ruby would do for a path that isn't actually on the disk.
+    fixture(@archive, "tree/leaf", "x")
+    mount_archive
+    assert_raises(Errno::ENOENT) { File.size("tree") }
+  end
+
   # ---------- File.copy_stream / IO.copy_stream ----------
 
   def test_file_copy_stream_from_archive_to_real_fs

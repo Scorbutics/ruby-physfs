@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Ruby ${{ matrix.ruby }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ['3.1', '3.2', '3.3', '3.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libphysfs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libphysfs-dev
+
+      - name: Install libphysfs (macOS)
+        if: runner.os == 'macOS'
+        run: brew install physfs
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      # rake-compiler powers Rake::ExtensionTask in the Rakefile. Not
+      # bundled with Ruby, and the gem has no Gemfile, so install it
+      # directly here.
+      - name: Install build tooling
+        run: gem install rake-compiler
+
+      - name: Compile and test
+        run: rake test
+
+  # Stress the shim suite to guard against regressions of the
+  # prepended-module + rb_call_super_kw flake (random
+  # "Object is missing entry in generic_fields_tbl" Ruby BUG). One
+  # platform / one Ruby is enough — the failure mode was platform-
+  # independent and statistical, so 30 iterations on a single image
+  # gives a strong signal without doubling overall CI time.
+  stress:
+    name: Shim flake stress (30x)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libphysfs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libphysfs-dev
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install build tooling
+        run: gem install rake-compiler
+
+      - name: Compile once
+        run: rake compile
+
+      - name: Run shim suite 30 times
+        run: |
+          set -e
+          for i in $(seq 1 30); do
+            ruby -W0 -Ilib tests/test_vfs_shim.rb > /tmp/run-$i.log 2>&1 \
+              || { echo "Iteration $i failed:"; cat /tmp/run-$i.log; exit 1; }
+          done
+          echo "All 30 iterations passed."
