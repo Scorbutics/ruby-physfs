@@ -279,6 +279,76 @@ class TestVFSShim < Minitest::Test
     assert_raises(LoadError) { require("nope_does_not_exist_anywhere") }
   end
 
+  def test_require_strips_leading_dot_slash
+    # Regression: PhysFS's path sanitizer rejects any "." or ".." segment
+    # with PHYSFS_ERR_BAD_FILENAME. Naively forwarding "./Game.rb" through
+    # to PHYSFS_exists() returns false, so the require falls through to a
+    # LoadError even though the file is in the archive. The shim must
+    # normalize before consulting PhysFS.
+    fixture(@archive, "vfs_dotslash_module.rb", "$vfs_dotslash_loaded = :ok")
+    mount_archive
+    assert require("./vfs_dotslash_module.rb")
+    assert_equal :ok, $vfs_dotslash_loaded
+  end
+
+  def test_file_apis_strip_leading_dot_slash
+    fixture(@archive, "leading_dot.txt", "ok")
+    mount_archive
+    assert File.exist?("./leading_dot.txt")
+    assert File.file?("./leading_dot.txt")
+    assert_equal "ok", File.read("./leading_dot.txt")
+  end
+
+  def test_require_strips_write_dir_prefix_from_absolute_path
+    # Regression: pokemonsdk's loader does
+    #   psdk_path = File.expand_path('pokemonsdk')
+    #   require "#{psdk_path}/scripts/ScriptLoad.rb"
+    # The expand_path step (not shimmed) yields a real-FS absolute path
+    # under the project root, but the file actually lives in the archive.
+    # When the resolved path lives under PhysFS.write_dir, the shim must
+    # strip that prefix so the require resolves through the archive.
+    fixture(@archive, "pokemonsdk/scripts/Loader.rb",
+            "$vfs_writedir_loader = :ok")
+    PhysFS.write_dir = @write
+    mount_archive
+    abs = File.join(@write, "pokemonsdk/scripts/Loader.rb")
+    assert require(abs)
+    assert_equal :ok, $vfs_writedir_loader
+  end
+
+  def test_file_apis_strip_write_dir_prefix_from_absolute_path
+    fixture(@archive, "deep/asset.txt", "ARCHIVED")
+    PhysFS.write_dir = @write
+    mount_archive
+    abs = File.join(@write, "deep/asset.txt")
+    assert File.exist?(abs)
+    assert_equal "ARCHIVED", File.read(abs)
+  end
+
+  def test_absolute_path_outside_write_dir_falls_through_to_real_fs
+    # Sanity-check: paths whose prefix isn't write_dir must NOT be
+    # stripped — they're real-FS lookups and the original absolute path
+    # has to reach super unchanged.
+    real = fixture(@real, "outside.txt", "on-disk")
+    PhysFS.write_dir = @write
+    mount_archive
+    assert File.exist?(real)
+    assert_equal "on-disk", File.read(real)
+  end
+
+  def test_dir_entries_dot_preserved_for_real_fs_fallthrough
+    # The "." preservation guard inside normalizePhysFSPath: a bare "."
+    # must not be rewritten to "" (the archive root). Otherwise
+    # Dir.entries(".") would silently start listing the archive instead
+    # of the real cwd. We verify by mounting an archive that contains a
+    # uniquely-named file and asserting it does NOT show up in the real
+    # cwd's entries.
+    fixture(@archive, "vfs_root_marker_xyz.txt", "x")
+    mount_archive
+    entries = Dir.entries(".")
+    refute_includes entries, "vfs_root_marker_xyz.txt"
+  end
+
   def test_require_relative_resolves_against_caller_file
     # caller_locations gives us the path of THIS test file, so the relative
     # require should look in tests/. Use a transient file there.

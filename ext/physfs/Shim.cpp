@@ -184,19 +184,48 @@ namespace {
 		return std::string{ RSTRING_PTR(v), static_cast<std::size_t>(RSTRING_LEN(v)) };
 	}
 
+	// PhysFS rejects any path containing a "." or ".." segment via
+	// PHYSFS_ERR_BAD_FILENAME, so idiomatic Ruby paths like "./Game.rb"
+	// silently miss archive lookups. Collapse those segments before
+	// consulting physfs_gem. A bare "." is preserved verbatim so callers
+	// like Dir.entries(".") fall through to the real filesystem instead
+	// of being rerouted to the archive root.
+	//
+	// Application code (notably the pokemonsdk loader) also builds
+	// absolute paths via File.expand_path against the project root and
+	// then requires them — a real-FS-shaped string for content that
+	// actually lives in the archive. If the result lives under the
+	// configured PhysFS.write_dir, strip that prefix so the lookup hits
+	// the archive instead of the non-existent real-FS location. Mirrors
+	// what the legacy ruby_physfs_patch.rb did via path_in_assets.
+	std::string normalizePhysFSPath(const std::string& path) {
+		if (path.empty() || path == ".") return path;
+		std::string out = std::filesystem::path(path).lexically_normal().generic_string();
+		if (out == ".") out = path;
+		if (!out.empty() && out[0] == '/') {
+			const auto& root = physfs_gem::getWriteDir();
+			if (!root.empty() && out.size() > root.size() &&
+				out.compare(0, root.size(), root) == 0 &&
+				(root.back() == '/' || out[root.size()] == '/')) {
+				out.erase(0, root.size());
+				while (!out.empty() && out[0] == '/') out.erase(0, 1);
+			}
+		}
+		return out;
+	}
+
 	// Apply the virtual chdir state if the verbatim path doesn't exist on
 	// the real filesystem. Mirrors what the legacy patch did with its
 	// path_in_assets() helper, but in a single uniform call site.
 	std::string resolveVirtualPath(VALUE rb_path) {
 		std::string path = toStdString(rb_path);
-		if (g_virtual_pwd.empty() || path.empty() || path[0] == '/') {
-			return path;
+		if (!path.empty() && path[0] != '/' && !g_virtual_pwd.empty()) {
+			std::error_code ec;
+			if (!std::filesystem::exists(path, ec)) {
+				path = g_virtual_pwd + "/" + path;
+			}
 		}
-		std::error_code ec;
-		if (std::filesystem::exists(path, ec)) {
-			return path;
-		}
-		return g_virtual_pwd + "/" + path;
+		return normalizePhysFSPath(path);
 	}
 
 	enum class OpenIntent { Read, Write };
@@ -223,35 +252,62 @@ namespace {
 	}
 
 	// ------------------------------------------------------------------
-	// File overrides — uniform shape.
+	// File / Dir / IO overrides — uniform shape.
+	//
+	// Every override below follows the same checklist before doing any
+	// VFS work, and the order matters:
+	//
+	//   1. SHIM_PASSTHROUGH_IF_INACTIVE — short-circuit when the shim is
+	//      not active (e.g. unmounted), preserving zero-overhead semantics.
+	//   2. rb_keyword_given_p() → super-forward. Always check this FIRST,
+	//      before reading argv in any way.
+	//   3. argc bounds check → super-forward when the call shape is
+	//      something we don't VFS-handle (extra args, etc.).
+	//   4. RB_TYPE_P(argv[i], T_STRING) → super-forward on non-string
+	//      args. We do NOT call to_str / rb_check_string_type — that
+	//      would dispatch user code in a frame that's still mid-override,
+	//      and it would also let exotic argv shapes reach our VFS path.
+	//   5. Only after all the above: read argv directly (NEVER via
+	//      rb_scan_args) and branch on physfs_gem::exists / isDirectory.
+	//
+	// Why no rb_scan_args: when invoked from a prepended-module override,
+	// rb_scan_args mutates Ruby's per-frame call-info / cd state, and a
+	// subsequent rb_call_super_kw can then forward an inconsistent frame
+	// to the parent method. The corruption surfaces randomly, often many
+	// calls later, as the "Object is missing entry in generic_fields_tbl"
+	// internal BUG. Reading argv directly avoids the trigger entirely.
 	// ------------------------------------------------------------------
 
 	VALUE rb_File_exist_q(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		VALUE path; rb_scan_args(argc, argv, "1", &path);
-		if (physfs_gem::exists(resolveVirtualPath(path))) return Qtrue;
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		if (physfs_gem::exists(resolveVirtualPath(argv[0]))) return Qtrue;
 		return shim_super_kw(argc, argv);
 	}
 
 	VALUE rb_File_directory_q(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		VALUE path; rb_scan_args(argc, argv, "1", &path);
-		if (physfs_gem::isDirectory(resolveVirtualPath(path))) return Qtrue;
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		if (physfs_gem::isDirectory(resolveVirtualPath(argv[0]))) return Qtrue;
 		return shim_super_kw(argc, argv);
 	}
 
 	VALUE rb_File_file_q(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		VALUE path; rb_scan_args(argc, argv, "1", &path);
-		const auto p = resolveVirtualPath(path);
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		const auto p = resolveVirtualPath(argv[0]);
 		if (physfs_gem::exists(p) && !physfs_gem::isDirectory(p)) return Qtrue;
 		return shim_super_kw(argc, argv);
 	}
 
 	VALUE rb_File_mtime(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		VALUE path; rb_scan_args(argc, argv, "1", &path);
-		const auto p = resolveVirtualPath(path);
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		const auto p = resolveVirtualPath(argv[0]);
 		if (physfs_gem::exists(p)) return rb_time_new(physfs_gem::mtime(p), 0);
 		return shim_super_kw(argc, argv);
 	}
@@ -260,7 +316,8 @@ namespace {
 	// is VFS-backed. length/offset variants fall through to super.
 	VALUE rb_File_read(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (argc != 1) return shim_super_kw(argc, argv);
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 		const auto p = resolveVirtualPath(argv[0]);
 		if (!physfs_gem::exists(p)) return shim_super_kw(argc, argv);
 		return forceUtf8(readVfsAsRubyString(p));
@@ -268,7 +325,8 @@ namespace {
 
 	VALUE rb_File_binread(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (argc != 1) return shim_super_kw(argc, argv);
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 		const auto p = resolveVirtualPath(argv[0]);
 		if (!physfs_gem::exists(p)) return shim_super_kw(argc, argv);
 		return readVfsAsRubyString(p);
@@ -276,7 +334,8 @@ namespace {
 
 	VALUE rb_File_readlines(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (argc != 1) return shim_super_kw(argc, argv);
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 		const auto p = resolveVirtualPath(argv[0]);
 		if (!physfs_gem::exists(p)) return shim_super_kw(argc, argv);
 		VALUE bytes = forceUtf8(readVfsAsRubyString(p));
@@ -301,8 +360,9 @@ namespace {
 	// rely on the full Ruby File.open contract keep working unchanged.
 	VALUE rb_File_open(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (argc < 1 || argc > 2) return shim_super_kw(argc, argv);
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc < 1 || argc > 2) return shim_super_kw(argc, argv);
+		if (!RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 
 		const VALUE mode_v = (argc >= 2) ? argv[1] : Qnil;
 		if (!NIL_P(mode_v) && !RB_TYPE_P(mode_v, T_STRING)) {
@@ -327,12 +387,14 @@ namespace {
 	VALUE rb_File_copy_stream(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
-		VALUE src, dst;
-		rb_scan_args(argc, argv, "2*", &src, &dst);
-		const auto sp = resolveVirtualPath(src);
+		if (argc < 2) return shim_super_kw(argc, argv);
+		if (!RB_TYPE_P(argv[0], T_STRING) || !RB_TYPE_P(argv[1], T_STRING)) {
+			return shim_super_kw(argc, argv);
+		}
+		const auto sp = resolveVirtualPath(argv[0]);
 		if (!physfs_gem::exists(sp)) return shim_super_kw(argc, argv);
 		const auto buf = physfs_gem::loadFully(sp);
-		const auto dst_path = toStdString(dst);
+		const auto dst_path = toStdString(argv[1]);
 		std::error_code ec;
 		const auto parent = std::filesystem::path(dst_path).parent_path();
 		if (!parent.empty()) std::filesystem::create_directories(parent, ec);
@@ -350,10 +412,10 @@ namespace {
 	VALUE rb_Dir_chdir(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
-		VALUE path;
-		rb_scan_args(argc, argv, "01", &path);
-		if (NIL_P(path)) return shim_super_kw(argc, argv);
-		const std::string p = toStdString(path);
+		// 0-arg form (chdir to home) and >1 arg (illegal) → super-forward.
+		if (argc != 1) return shim_super_kw(argc, argv);
+		if (!RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		const std::string p = toStdString(argv[0]);
 		std::error_code ec;
 		if (std::filesystem::is_directory(p, ec)) return shim_super_kw(argc, argv);
 
@@ -385,8 +447,9 @@ namespace {
 	// location only. Just super-forward.
 	VALUE rb_Dir_glob(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (argc < 1) return shim_super_kw(argc, argv);
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc < 1) return shim_super_kw(argc, argv);
+		if (!RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 
 		const auto resolved = resolveVirtualPath(argv[0]);
 		const VALUE adjusted = rb_str_new(resolved.data(), static_cast<long>(resolved.size()));
@@ -400,14 +463,9 @@ namespace {
 
 	VALUE rb_Dir_entries(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		// Kwargs (encoding:) → super-forward without touching argv. Even
-		// reading the kwargs Hash via rb_scan_args "1*" can leave Ruby's
-		// internal call-info state mismatched with our forwarded super,
-		// which manifests as a "generic_fields_tbl" BUG much later.
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
-		VALUE path;
-		rb_scan_args(argc, argv, "1*", &path);
-		const auto p = resolveVirtualPath(path);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		const auto p = resolveVirtualPath(argv[0]);
 		if (!physfs_gem::isDirectory(p)) return shim_super_kw(argc, argv);
 		const auto entries = physfs_gem::enumerate(p);
 		VALUE out = rb_ary_new_capa(static_cast<long>(entries.size()) + 2);
@@ -421,8 +479,9 @@ namespace {
 
 	VALUE rb_Dir_exist_q(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		VALUE path; rb_scan_args(argc, argv, "1", &path);
-		if (physfs_gem::isDirectory(resolveVirtualPath(path))) return Qtrue;
+		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
+		if (argc != 1 || !RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
+		if (physfs_gem::isDirectory(resolveVirtualPath(argv[0]))) return Qtrue;
 		return shim_super_kw(argc, argv);
 	}
 
@@ -453,9 +512,13 @@ namespace {
 		rb_set_errinfo(Qnil);
 		if (!rb_obj_is_kind_of(err, rb_eLoadError)) rb_exc_raise(err);
 
-		// Try VFS as the fallback. Append .rb if the caller didn't.
+		// Try VFS as the fallback. Append .rb if the caller didn't, then
+		// normalize so leading "./" (and any embedded "." / ".." segments)
+		// are collapsed before PhysFS sees them — its sanitizer rejects
+		// paths with such segments outright.
 		std::string n = toStdString(name);
 		if (n.size() < 3 || n.substr(n.size() - 3) != ".rb") n += ".rb";
+		n = normalizePhysFSPath(n);
 		if (!physfs_gem::exists(n)) rb_exc_raise(err);
 
 		// Honor $LOADED_FEATURES so re-require is idempotent.
