@@ -8,11 +8,17 @@ ext_name = 'physfs'
 # C++17 — uses std::filesystem, std::string_view, [[noreturn]], etc.
 $CXXFLAGS += ' -std=c++17 -Wall '
 
-# Locate libphysfs. Three resolution strategies in order:
+# Locate libphysfs. Resolution strategies in order:
 #   1. PHYSFS_DIR env var (prefix containing include/ and lib/)
-#   2. system path (apt: libphysfs-dev / brew: physfs)
-#   3. fail with a clear message
+#   2. Homebrew prefix on macOS (Apple Silicon installs to /opt/homebrew,
+#      which mkmf does not search by default)
+#   3. system path (apt: libphysfs-dev)
+#   4. fail with a clear message
 physfs_root = ENV['PHYSFS_DIR']
+if (physfs_root.nil? || physfs_root.empty?) && RUBY_PLATFORM.include?('darwin')
+  brew_prefix = `brew --prefix physfs 2>/dev/null`.strip
+  physfs_root = brew_prefix unless brew_prefix.empty?
+end
 if physfs_root && !physfs_root.empty?
   $INCFLAGS << " -I'#{physfs_root}/include'"
   $LDFLAGS  << " -L'#{physfs_root}/lib'"
