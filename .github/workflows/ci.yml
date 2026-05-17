@@ -38,7 +38,7 @@ jobs:
       # bundled with Ruby, and the gem has no Gemfile, so install it
       # directly here.
       - name: Install build tooling
-        run: gem install rake-compiler
+        run: gem install rake-compiler rubyzip
 
       - name: Compile and test
         run: rake test
@@ -66,7 +66,7 @@ jobs:
           ruby-version: '3.3'
 
       - name: Install build tooling
-        run: gem install rake-compiler
+        run: gem install rake-compiler rubyzip
 
       - name: Compile once
         run: rake compile
