@@ -1,5 +1,6 @@
 #include "Bindings.h"
 #include "PhysFSGem.h"
+#include "PhysFSLock.h"
 #include "RubyIoBridge.h"
 #include "Shim.h"
 #include "physfs_wrapper.h"
@@ -135,6 +136,14 @@ namespace {
 		// semantic — exactly equivalent to Ruby's Dir.glob via File.fnmatch?.
 		return PhysFSShim_Glob(pattern, flags);
 	}
+
+	// Returns the gem-wide reentrant Monitor that serializes every PhysFS
+	// entry point. Exposed so other gems (LiteRGSS / LiteCGSS) that also
+	// call into PhysFS directly can share the same lock — without it, the
+	// GVL-vs-stateLock inversion described in PhysFSLock.h re-emerges.
+	VALUE rb_PhysFS_Monitor(VALUE) {
+		return physfs_gem::getMonitor();
+	}
 }
 
 void PhysFSGem_DefineModuleMethods() {
@@ -149,6 +158,7 @@ void PhysFSGem_DefineModuleMethods() {
 	rb_define_module_function(rb_mPhysFS, "read",            _rbf rb_PhysFS_Read,           1);
 	rb_define_module_function(rb_mPhysFS, "enumerate",       _rbf rb_PhysFS_Enumerate,      1);
 	rb_define_module_function(rb_mPhysFS, "glob",            _rbf rb_PhysFS_Glob,          -1);
+	rb_define_module_function(rb_mPhysFS, "monitor",         _rbf rb_PhysFS_Monitor,        0);
 
 	// Define PhysFS.install_shim! / .uninstall_shim! / .shim_installed?
 	// — the transparent File / Dir / IO / Kernel#require overrides are
