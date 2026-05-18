@@ -368,17 +368,41 @@ namespace {
 	// Read intent → StringIO over VFS bytes (or super if not in VFS).
 	// Write intent → straight to super (real fopen, supports rename/fsync).
 	//
-	// Only the simple File.open(path, "r"|"rb") form is VFS-handled. Any
-	// other shape — numeric mode, kwargs (encoding:, etc.), perm bits,
-	// extra positional args — bails to super so callers like Tempfile that
-	// rely on the full Ruby File.open contract keep working unchanged.
+	// Keyword args are extracted from argv (last slot, when
+	// rb_keyword_given_p() is true) and the read path is still taken so
+	// archive-bundled files keep working when callers pass `encoding:` or
+	// other IO kwargs. Motivated by stdlib `CSV.open`, which does
+	//   File.open(filename, mode, **file_opts)
+	// internally — before this, the shim's blanket "bail on kwargs"
+	// short-circuit meant every CSV read fell through to native fopen,
+	// which then ENOENT'd on archive-only assets like PSDK's
+	// Data/Text/Dialogs/<id>.csv.
+	//
+	// We honour `encoding:` by force_encoding'ing the StringIO's backing
+	// string; other kwargs (binmode:, autoclose:, newline:, perm bits)
+	// don't apply to StringIO and are silently dropped. Anything that
+	// genuinely needs the real File contract — numeric mode flags,
+	// non-String first arg, write/append/update modes — still bails to
+	// super so Tempfile et al. keep working unchanged.
 	VALUE rb_File_open(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
-		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
-		if (argc < 1 || argc > 2) return shim_super_kw(argc, argv);
+
+		// Peel off the kwargs hash if it was passed via `**`; everything
+		// before it is the positional argv we evaluate below.
+		VALUE kwargs = Qnil;
+		int positional_argc = argc;
+		if (rb_keyword_given_p() && argc >= 1) {
+			const VALUE last = argv[argc - 1];
+			if (RB_TYPE_P(last, T_HASH)) {
+				kwargs = last;
+				positional_argc = argc - 1;
+			}
+		}
+
+		if (positional_argc < 1 || positional_argc > 2) return shim_super_kw(argc, argv);
 		if (!RB_TYPE_P(argv[0], T_STRING)) return shim_super_kw(argc, argv);
 
-		const VALUE mode_v = (argc >= 2) ? argv[1] : Qnil;
+		const VALUE mode_v = (positional_argc >= 2) ? argv[1] : Qnil;
 		if (!NIL_P(mode_v) && !RB_TYPE_P(mode_v, T_STRING)) {
 			return shim_super_kw(argc, argv);  // numeric flags etc.
 		}
@@ -388,6 +412,32 @@ namespace {
 		if (!physfs_gem::exists(p)) return shim_super_kw(argc, argv);
 
 		VALUE bytes = readVfsAsRubyString(p);
+		if (!NIL_P(kwargs)) {
+			VALUE encoding = rb_hash_aref(kwargs, ID2SYM(rb_intern("encoding")));
+			if (!NIL_P(encoding)) {
+				// File.open accepts pseudo-encoding directives that
+				// String#force_encoding does not, notably the `bom|<name>`
+				// prefix (which tells the real IO layer to consume a BOM and
+				// then treat the remainder as <name>). Strip BOM bytes if
+				// present and pass the suffix to force_encoding. Stdlib CSV
+				// hits this path with `bom|utf-8` on every read.
+				if (RB_TYPE_P(encoding, T_STRING)) {
+					const char* cstr = StringValueCStr(encoding);
+					if (strncmp(cstr, "bom|", 4) == 0) {
+						const long len = RSTRING_LEN(bytes);
+						const char* bs = RSTRING_PTR(bytes);
+						if (len >= 3 &&
+						    static_cast<unsigned char>(bs[0]) == 0xEF &&
+						    static_cast<unsigned char>(bs[1]) == 0xBB &&
+						    static_cast<unsigned char>(bs[2]) == 0xBF) {
+							bytes = rb_str_new(bs + 3, len - 3);
+						}
+						encoding = rb_str_new_cstr(cstr + 4);
+					}
+				}
+				rb_funcall(bytes, rb_intern("force_encoding"), 1, encoding);
+			}
+		}
 		VALUE rb_StringIO = rb_const_get(rb_cObject, rb_intern("StringIO"));
 		VALUE io = rb_funcall(rb_StringIO, rb_intern("new"), 1, bytes);
 		if (!rb_block_given_p()) return io;

@@ -168,6 +168,79 @@ class TestVFSShim < Minitest::Test
     assert_equal "first\nsecond\n", File.binread(target)
   end
 
+  # ---------- File.open with keyword arguments ----------
+  #
+  # The shim originally bailed to super whenever rb_keyword_given_p() was
+  # true. That made any caller using `File.open(path, mode, **opts)` — most
+  # commonly stdlib CSV.open passing `encoding:` — fall through to native
+  # rb_sysopen, which then ENOENT'd on archive-only files. These tests pin
+  # the kwargs-aware path so the regression can't come back.
+
+  def test_file_open_read_accepts_encoding_kwarg
+    fixture(@archive, "data.txt", "héllo")
+    mount_archive
+    content = File.open("data.txt", "r", encoding: "UTF-8") { |io| io.read }
+    assert_equal "héllo", content
+    assert_equal Encoding::UTF_8, content.encoding
+  end
+
+  def test_file_open_read_with_bom_utf8_pseudo_encoding_strips_bom
+    # Stdlib CSV.open passes `encoding: "bom|utf-8"` for every read it does
+    # against a binary-mode handle. The pseudo-prefix is a File.open
+    # directive: consume a UTF-8 BOM if present, then treat the remainder
+    # as UTF-8. String#force_encoding doesn't understand "bom|utf-8" on
+    # its own — the shim has to translate.
+    bom = "\xEF\xBB\xBF".b
+    fixture(@archive, "with_bom.txt", bom + "abc")
+    mount_archive
+    content = File.open("with_bom.txt", "rb", encoding: "bom|utf-8") { |io| io.read }
+    assert_equal "abc", content
+    assert_equal Encoding::UTF_8, content.encoding
+  end
+
+  def test_file_open_read_with_bom_utf8_when_bom_absent_still_decodes
+    # Same pseudo-encoding, but the file doesn't actually start with a
+    # BOM. The shim must NOT strip anything — only the literal BOM bytes
+    # at the start of the payload qualify.
+    fixture(@archive, "no_bom.txt", "abc")
+    mount_archive
+    content = File.open("no_bom.txt", "rb", encoding: "bom|utf-8") { |io| io.read }
+    assert_equal "abc", content
+    assert_equal Encoding::UTF_8, content.encoding
+  end
+
+  def test_file_open_read_kwargs_without_block_returns_io
+    fixture(@archive, "data.txt", "abc")
+    mount_archive
+    io = File.open("data.txt", "rb", encoding: "UTF-8")
+    assert_equal "abc", io.read
+    io.close
+  end
+
+  def test_file_open_write_mode_with_kwargs_falls_through_to_real_fs
+    # Even with kwargs the shim must NOT swallow write opens — the
+    # write-mode bail to super must still win so saves land on the real
+    # filesystem (where rename/fsync work).
+    target = File.join(@real, "with_kwargs.txt")
+    mount_archive
+    File.open(target, "w", encoding: "UTF-8") { |f| f.write("written") }
+    assert File.exist?(target)
+    assert_equal "written", File.binread(target)
+  end
+
+  def test_csv_read_resolves_against_archive_when_only_kwargs_path_is_available
+    # End-to-end repro of the failure that motivated the kwargs fix:
+    # CSV.open internally does `File.open(filename, mode, **file_opts)`
+    # with `encoding: "bom|utf-8"`. Before the fix, this short-circuited
+    # to native fopen and ENOENT'd because the file only lived inside
+    # the mounted archive, never on the host filesystem.
+    require "csv"
+    fixture(@archive, "Data/Text/Dialogs/9000.csv", "col1,col2\nfoo,42\n")
+    mount_archive
+    rows = CSV.read("Data/Text/Dialogs/9000.csv")
+    assert_equal [["col1", "col2"], ["foo", "42"]], rows
+  end
+
   # ---------- File.new ----------
 
   def test_file_new_read_returns_stringio_for_archived_file
