@@ -499,6 +499,100 @@ namespace {
 		return LL2NUM(static_cast<long long>(written));
 	}
 
+	// File.binwrite(path, string [, offset] [, **opts]):
+	// Native filesystem write that ENOENTs when the parent path doesn't
+	// exist. Our own Dir.exist? / File.directory? shims report `true` for
+	// any path resolvable through ANY mount — including the read-only
+	// archive — which makes the common
+	//
+	//     mkdir(*dirname.split('/')) unless Dir.exist?(dirname)
+	//     File.binwrite(filename, contents)
+	//
+	// pattern skip the actual native mkdir whenever the archive happens to
+	// shadow that directory. The subsequent native binwrite then ENOENTs
+	// against the empty writeDir-side parent.
+	//
+	// Fix it once for every caller: walk every parent component via
+	// std::filesystem::create_directories (which is idempotent — already-
+	// existing components hit EEXIST under the hood and are ignored)
+	// before super-forwarding to native binwrite. Stdlib uses for binwrite
+	// (Tempfile.create rotation, Marshal.dump-to-disk patterns) keep
+	// working unchanged because create_directories is a no-op on already-
+	// existing trees.
+	VALUE rb_File_binwrite(int argc, VALUE* argv, VALUE /*self*/) {
+		SHIM_PASSTHROUGH_IF_INACTIVE();
+		if (argc >= 1 && RB_TYPE_P(argv[0], T_STRING)) {
+			const std::string path = toStdString(argv[0]);
+			const auto parent = std::filesystem::path(path).parent_path();
+			if (!parent.empty() && parent != ".") {
+				std::error_code ec;
+				std::filesystem::create_directories(parent, ec);
+				// Ignore errors here on purpose — if the directory really
+				// can't be created the super call below will surface a
+				// proper Errno::* with the exact reason.
+			}
+		}
+		return shim_super_kw(argc, argv);
+	}
+
+	// File.delete(*paths):
+	// Native delete raises Errno::ENOENT when the path doesn't exist on
+	// the real filesystem. With archives mounted, callers can reasonably
+	// hold a path that resolves through the shim (via a read-only mount)
+	// but has no writeDir-side native presence — and PSDK's
+	// ScriptLoad.rb#start does exactly that for `pokemonsdk/scripts/{
+	// mega_script.deflate, scripts.dat}` during cache-invalidation. From
+	// the writable side's perspective those files don't exist anyway, so
+	// dropping the delete is the consistent answer.
+	//
+	// Strategy: filter out arguments that aren't on the native FS but ARE
+	// in PhysFS (i.e. read-only mount paths). Whatever's left we forward
+	// to super, preserving the standard ENOENT-for-truly-missing-paths
+	// behaviour. Returning the number of paths actually delegated keeps
+	// the contract of File.delete close to what callers expect (Ruby's
+	// docs say it returns the number of files deleted; super does that).
+	VALUE rb_File_delete(int argc, VALUE* argv, VALUE /*self*/) {
+		SHIM_PASSTHROUGH_IF_INACTIVE();
+
+		std::vector<VALUE> forward;
+		forward.reserve(argc);
+		int dropped = 0;
+		for (int i = 0; i < argc; ++i) {
+			const VALUE arg = argv[i];
+			if (!RB_TYPE_P(arg, T_STRING)) {
+				forward.push_back(arg);
+				continue;
+			}
+			std::error_code ec;
+			const std::string native_path = toStdString(arg);
+			if (!std::filesystem::exists(native_path, ec)) {
+				const auto vpath = resolveVirtualPath(arg);
+				if (physfs_gem::exists(vpath)) {
+					// Read-only mount path. Treat the delete as a no-op:
+					// the caller can't observe the file as present on the
+					// writable side anyway, so "already gone" is the
+					// consistent answer.
+					++dropped;
+					continue;
+				}
+			}
+			forward.push_back(arg);
+		}
+
+		if (forward.empty()) return INT2FIX(dropped);
+
+		// Ruby's File.delete contract returns "the number of names passed
+		// as arguments". We super-forward only the surviving names, so
+		// super's return value is (forward.size()) — we add back `dropped`
+		// so the caller sees the same count they would have without the
+		// shim filter.
+		const VALUE result = shim_super_kw(static_cast<int>(forward.size()), forward.data());
+		if (dropped > 0 && RB_INTEGER_TYPE_P(result)) {
+			return LONG2NUM(NUM2LONG(result) + dropped);
+		}
+		return result;
+	}
+
 	// ------------------------------------------------------------------
 	// Dir overrides
 	// ------------------------------------------------------------------
@@ -686,6 +780,8 @@ namespace {
 		rb_define_method(m_FileShim, "open",        _rbf rb_File_open,         -1);
 		rb_define_method(m_FileShim, "new",         _rbf rb_File_new,          -1);
 		rb_define_method(m_FileShim, "copy_stream", _rbf rb_File_copy_stream,  -1);
+		rb_define_method(m_FileShim, "binwrite",    _rbf rb_File_binwrite,     -1);
+		rb_define_method(m_FileShim, "delete",      _rbf rb_File_delete,       -1);
 		rb_prepend_module(rb_singleton_class(rb_cFile), m_FileShim);
 
 		VALUE m_DirShim = rb_define_module_under(rb_mPhysFS, "DirShim");

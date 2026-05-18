@@ -324,6 +324,105 @@ class TestVFSShim < Minitest::Test
     assert_equal "abcdef", File.binread(dst)
   end
 
+  # ---------- File.binwrite ----------
+  #
+  # The shim's File.directory? / Dir.exist? return true for any path
+  # resolvable through ANY mount, including the read-only archive. That
+  # makes the common "mkdir(dir) unless Dir.exist?(dir); File.binwrite(
+  # path, data)" pattern skip the actual native mkdir whenever the
+  # archive shadows the writeDir-side parent, and binwrite then ENOENTs.
+  # The shim's File.binwrite wrap pre-creates the native parent path
+  # via std::filesystem::create_directories before delegating to the
+  # real binwrite, fixing that whole class of caller error once.
+
+  def test_file_binwrite_creates_native_parent_directories
+    mount_archive
+    target = File.join(@write, "deep/nested/path/output.txt")
+    refute File.directory?(File.dirname(target)),
+           "preconditions: nested parent must not exist before binwrite"
+    File.binwrite(target, "hello")
+    assert_equal "hello", File.binread(target)
+    assert File.directory?(File.dirname(target))
+  end
+
+  def test_file_binwrite_succeeds_when_archive_shadows_parent_dir
+    # Original failure shape: archive entry at pokemonsdk/scripts/anchor.rb
+    # makes the shim's Dir.exist? report true for the parent path, so
+    # callers' "mkdir unless Dir.exist?" guards skip the native mkdir.
+    # Without the binwrite shim, the subsequent write ENOENTs into the
+    # empty writeDir-side parent. With it, the parent is created
+    # natively regardless of what the shim's Dir.exist? said.
+    fixture(@archive, "pokemonsdk/scripts/anchor.rb", "x")
+    mount_archive
+    Dir.chdir(@write) do
+      File.binwrite("pokemonsdk/scripts/new.rb", "fresh source")
+    end
+    written = File.join(@write, "pokemonsdk/scripts/new.rb")
+    assert_equal "fresh source", File.binread(written)
+  end
+
+  def test_file_binwrite_is_idempotent_for_existing_directories
+    # When the parent already exists natively, create_directories is a
+    # no-op — the behaviour of File.binwrite is unchanged from stock
+    # Ruby (overwrites the file in place).
+    mount_archive
+    target = File.join(@write, "x.txt")
+    File.binwrite(target, "v1")
+    File.binwrite(target, "v2")
+    assert_equal "v2", File.binread(target)
+  end
+
+  # ---------- File.delete ----------
+  #
+  # PSDK's ScriptLoad.rb#start performs cache-invalidation deletes
+  # against paths that may only exist in a read-only mount (the
+  # encrypted archive). Native File.delete would ENOENT on those. From
+  # the writable-side perspective the file isn't deletable anyway, so
+  # the shim silently drops such args and only forwards the rest. The
+  # standard Errno::ENOENT contract is preserved for paths that don't
+  # exist anywhere.
+
+  def test_file_delete_silently_skips_archive_only_paths
+    fixture(@archive, "archive_only.dat", "x")
+    mount_archive
+    # No raise, even though "archive_only.dat" has no native presence.
+    assert_equal 1, File.delete("archive_only.dat")
+    assert PhysFS.exist?("archive_only.dat"),
+           "archive entry is unaffected by the no-op delete (read-only mount)"
+  end
+
+  def test_file_delete_actually_deletes_native_files
+    target = File.join(@real, "doomed.txt")
+    File.binwrite(target, "bye")
+    mount_archive
+    assert File.exist?(target)
+    assert_equal 1, File.delete(target)
+    refute File.exist?(target)
+  end
+
+  def test_file_delete_raises_enoent_for_paths_missing_everywhere
+    mount_archive
+    # Path is on neither the native FS nor in any PhysFS mount — the
+    # standard contract still applies.
+    assert_raises(Errno::ENOENT) do
+      File.delete(File.join(@real, "ghost.txt"))
+    end
+  end
+
+  def test_file_delete_handles_mixed_archive_and_native_arguments
+    # Variadic call mixing one archive-only path with one real file:
+    # the archive entry is silently dropped, the native file is deleted,
+    # and the returned count reflects both names the caller passed.
+    fixture(@archive, "ghost_in_archive.dat", "x")
+    native = File.join(@real, "real.txt")
+    File.binwrite(native, "kill me")
+    mount_archive
+    assert_equal 2, File.delete("ghost_in_archive.dat", native)
+    refute File.exist?(native), "the real file is gone"
+    assert PhysFS.exist?("ghost_in_archive.dat"),
+           "the archive entry is unchanged"
+  end
+
   # ---------- Dir.[] / Dir.glob / Dir.entries / Dir.exist? ----------
 
   def test_dir_glob_brace_expansion_in_archive
