@@ -624,6 +624,77 @@ namespace {
 		);
 	}
 
+	// Merge VFS-side and native-FS glob results into a single array, deduping
+	// by CANONICAL ABSOLUTE PATH so the same logical file reachable through
+	// both layers surfaces exactly once.
+	//
+	// Why this is needed: VFS results from PhysFSShim_Glob are mount-relative
+	// strings (e.g. "scripts/foo.rb"); native Dir.glob returns paths shaped
+	// like the input pattern (absolute when the caller passed an absolute
+	// pattern, e.g. "/data/.../scripts/foo.rb"). When a file lives in both
+	// the mount and on the real FS — common when an archive's contents have
+	// been extracted to disk, or when the write_dir overlaps the mount root
+	// — the two arrays contain the same logical file as DIFFERENT strings.
+	// A plain Array#uniq doesn't merge them, so callers that iterate the
+	// result and process each path end up processing the same file twice.
+	// PSDK's ScriptCollector hit this on Android: every project script came
+	// back twice, the second eval re-aliased PFM::Options#initialize, and
+	// the alias chain closed into a circular dispatch that infinite-looped
+	// at Options.new on play-game.
+	//
+	// Dedup key: File.expand_path(path, write_dir). Absolute paths ignore
+	// the second arg; VFS-relative paths get rebased onto the active
+	// write_dir so they collide with their native counterpart. When no
+	// write_dir is set, fall back to File.expand_path's default (Dir.pwd).
+	//
+	// Output format: native paths are emitted first and win the format
+	// duel — they're what other Ruby APIs return for the same file, so
+	// callers that iterate the result and pass each path back into
+	// File.open / require / etc. don't have to translate. VFS-only entries
+	// are appended in their mount-relative form (no useful alternative).
+	VALUE merge_glob_results_dedup(VALUE vfs, VALUE native) {
+		if (!RB_TYPE_P(vfs, T_ARRAY))    vfs    = rb_ary_new();
+		if (!RB_TYPE_P(native, T_ARRAY)) native = rb_ary_new();
+
+		static const ID id_expand_path = rb_intern("expand_path");
+		const auto& wd = physfs_gem::getWriteDir();
+		const VALUE write_dir_str =
+			wd.empty() ? Qnil
+			           : rb_str_new(wd.data(), static_cast<long>(wd.size()));
+
+		auto canonical = [&](VALUE entry) -> VALUE {
+			if (NIL_P(write_dir_str)) {
+				return rb_funcall(rb_cFile, id_expand_path, 1, entry);
+			}
+			return rb_funcall(rb_cFile, id_expand_path, 2, entry, write_dir_str);
+		};
+
+		const VALUE seen = rb_hash_new();
+		const VALUE out  = rb_ary_new();
+
+		const long nlen = RARRAY_LEN(native);
+		for (long i = 0; i < nlen; ++i) {
+			VALUE entry = RARRAY_AREF(native, i);
+			if (!RB_TYPE_P(entry, T_STRING)) { rb_ary_push(out, entry); continue; }
+			VALUE key = canonical(entry);
+			if (NIL_P(rb_hash_aref(seen, key))) {
+				rb_hash_aset(seen, key, Qtrue);
+				rb_ary_push(out, entry);
+			}
+		}
+		const long vlen = RARRAY_LEN(vfs);
+		for (long i = 0; i < vlen; ++i) {
+			VALUE entry = RARRAY_AREF(vfs, i);
+			if (!RB_TYPE_P(entry, T_STRING)) { rb_ary_push(out, entry); continue; }
+			VALUE key = canonical(entry);
+			if (NIL_P(rb_hash_aref(seen, key))) {
+				rb_hash_aset(seen, key, Qtrue);
+				rb_ary_push(out, entry);
+			}
+		}
+		return out;
+	}
+
 	// Dir.[] / Dir.glob — merge VFS results with real-FS results so callers
 	// that mix archive and on-disk paths see both. Pattern matching delegates
 	// to File.fnmatch? (Ruby) so semantics — dotfile exclusion, backslash
@@ -633,6 +704,12 @@ namespace {
 	// `base:`, which scopes the search to a specific real-FS directory),
 	// we MUST NOT inject VFS results — the caller is asking for that one
 	// location only. Just super-forward.
+	//
+	// Dedup of the merged result set happens by canonical absolute path
+	// (see merge_glob_results_dedup), not by string equality. Without that,
+	// files reachable via both the mount and the real FS surface twice
+	// because their VFS form is mount-relative and their native form is
+	// pattern-shaped — Array#uniq keeps both.
 	VALUE rb_Dir_glob(int argc, VALUE* argv, VALUE /*self*/) {
 		SHIM_PASSTHROUGH_IF_INACTIVE();
 		if (rb_keyword_given_p()) return shim_super_kw(argc, argv);
@@ -643,10 +720,9 @@ namespace {
 		const VALUE adjusted = rb_str_new(resolved.data(), static_cast<long>(resolved.size()));
 		const int user_flags = (argc >= 2 && FIXNUM_P(argv[1])) ? NUM2INT(argv[1]) : 0;
 
-		VALUE out = PhysFSShim_Glob(adjusted, user_flags);
+		const VALUE vfs    = PhysFSShim_Glob(adjusted, user_flags);
 		const VALUE native = shim_super_kw(argc, argv);
-		if (RB_TYPE_P(native, T_ARRAY)) rb_ary_concat(out, native);
-		return rb_funcall(out, rb_intern("uniq"), 0);
+		return merge_glob_results_dedup(vfs, native);
 	}
 
 	VALUE rb_Dir_entries(int argc, VALUE* argv, VALUE /*self*/) {
