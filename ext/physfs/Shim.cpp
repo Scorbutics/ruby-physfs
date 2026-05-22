@@ -837,8 +837,42 @@ namespace {
 // =============================================================================
 
 namespace {
+	// Canonical "is the shim wired up?" probe: PhysFS::DirShim is the
+	// shortest-lived of our four shim modules, so its presence as a
+	// constant AND its membership in Dir.singleton_class.ancestors are
+	// jointly sufficient to prove the prepend pass below ran AND its
+	// result is still in the MRO. We probe DirShim specifically because
+	// it's prepended onto a class an embedder is most likely to touch
+	// (PSDK's snapshot/restore unprepends every ancestor added since
+	// capture); FileShim / IOShim / KernelShim all rise and fall with it
+	// because they're set up in the same pass.
+	bool shimModulesIntact() {
+		if (NIL_P(rb_mPhysFS)) return false;
+		const ID dirshim_id = rb_intern("DirShim");
+		if (!rb_const_defined_at(rb_mPhysFS, dirshim_id)) return false;
+		const VALUE dirshim = rb_const_get_at(rb_mPhysFS, dirshim_id);
+		const VALUE ancestors = rb_funcall(
+			rb_singleton_class(rb_cDir), rb_intern("ancestors"), 0);
+		return RTEST(rb_funcall(ancestors, rb_intern("include?"), 1, dirshim));
+	}
+
 	void ensureModulesPrepended() {
-		if (g_modules_prepended) return;
+		// Two-phase gate. The C-static is the fast path — set once at
+		// first activation, true for the rest of the process lifetime.
+		// But an embedder snapshot/restore pass can rip our prepended
+		// modules out of Dir/File/Kernel and remove the shim constants
+		// from the PhysFS module after they were registered (PSDK
+		// Android's PSDKVMSnapshot.restore! does exactly this: it
+		// reaps every constant and prepended ancestor added since its
+		// capture! baseline). The C-static survives that teardown; the
+		// Ruby-side state does not. Validate the actual Ruby state and
+		// re-run the prepend pass if it was undone externally —
+		// otherwise the next mount auto-activates the shim, every
+		// override checks g_shim_active and finds it true, but the
+		// override methods aren't in the MRO so File / Dir / Kernel#
+		// require silently fall through to stock Ruby, archive lookups
+		// miss, and the caller sees the archive as empty.
+		if (g_modules_prepended && shimModulesIntact()) return;
 
 		// Ensure StringIO is available for the File.open block-form path.
 		rb_require("stringio");
